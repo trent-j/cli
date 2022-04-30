@@ -4,35 +4,39 @@ package codespace
 
 import (
     "context"
+    "encoding/json"
     "errors"
     "fmt"
-    "io"
-    "log"
-    "net"
-    "os"
-    "path/filepath"
-    "strings"
-    "sync"
-    "text/template"
-
     "github.com/MakeNowJust/heredoc"
     "github.com/cli/cli/v2/internal/codespaces"
     "github.com/cli/cli/v2/internal/codespaces/api"
     "github.com/cli/cli/v2/pkg/cmdutil"
     "github.com/cli/cli/v2/pkg/liveshare"
     "github.com/spf13/cobra"
+    "io"
+    "log"
+    "net"
+    "os"
+    "os/exec"
+    "os/signal"
+    "path/filepath"
+    "strings"
+    "sync"
+    "syscall"
+    "text/template"
 )
 
 type sshOptions struct {
-    codespace   string
-    profile     string
-    serverPort  int
-    interactive bool
-    debug       bool
-    debugFile   string
-    stdio       bool
-    config      bool
-    scpArgs     []string // scp arguments, for 'cs cp' (nil for 'cs ssh')
+    codespace  string
+    profile    string
+    serverPort int
+    start      bool
+    detached   bool
+    debug      bool
+    debugFile  string
+    stdio      bool
+    config     bool
+    scpArgs    []string // scp arguments, for 'cs cp' (nil for 'cs ssh')
 }
 
 func newSSHCmd(app *App) *cobra.Command {
@@ -89,6 +93,8 @@ func newSSHCmd(app *App) *cobra.Command {
         RunE: func(cmd *cobra.Command, args []string) error {
             if opts.config {
                 return app.printOpenSSHConfig(cmd.Context(), opts)
+            } else if opts.start {
+                return app.startSSH(cmd.Context(), opts)
             } else {
                 return app.SSH(cmd.Context(), args, opts)
             }
@@ -103,11 +109,16 @@ func newSSHCmd(app *App) *cobra.Command {
     sshCmd.Flags().StringVarP(&opts.debugFile, "debug-file", "", "", "Path of the file log to")
     sshCmd.Flags().BoolVarP(&opts.config, "config", "", false, "Write OpenSSH configuration to stdout")
     sshCmd.Flags().BoolVar(&opts.stdio, "stdio", false, "Proxy sshd connection to stdio")
-    sshCmd.Flags().BoolVar(&opts.interactive, "non-interactive", true, "Forward SSH server port and print connection details as JSON")
-    sshCmd.Flag("non-interactive").NoOptDefVal = "false"
 
     if err := sshCmd.Flags().MarkHidden("stdio"); err != nil {
         fmt.Fprintf(os.Stderr, "%v\n", err)
+    }
+
+    sshCmd.Flags().BoolVar(&opts.start, "start", false, "Forward SSH server port and print connection details")
+    sshCmd.Flags().BoolVar(&opts.detached, "detached", false, "Forward SSH server port and print connection details")
+
+    if err := sshCmd.Flags().MarkHidden("detached"); err != nil {
+        _, _ = fmt.Fprintf(os.Stderr, "%v\n", err)
     }
 
     return sshCmd
@@ -190,6 +201,26 @@ func (a *App) SSH(ctx context.Context, sshArgs []string, opts sshOptions) (err e
         tunnelClosed <- fwd.ForwardToListener(ctx, listen) // always non-nil
     }()
 
+    if opts.detached {
+
+        connDetails := newSSHConnectionDetails(sshUser, localSSHServerPort)
+        a.errLogger.Println(connDetails.toJson())
+
+        parent, err := os.FindProcess(os.Getppid())
+
+        if err != nil {
+            return err
+        }
+
+        if err := parent.Signal(syscall.SIGUSR1); err != nil {
+            return err
+        }
+
+        for {
+            select {}
+        }
+    }
+
     shellClosed := make(chan error, 1)
     go func() {
         var err error
@@ -210,6 +241,35 @@ func (a *App) SSH(ctx context.Context, sshArgs []string, opts sshOptions) (err e
         }
         return nil // success
     }
+}
+
+type sshConnectionDetails struct {
+    Host    string `json:"host"`
+    User    string `json:"user"`
+    Port    int    `json:"port"`
+    Command string `json:"command"`
+}
+
+func newSSHConnectionDetails(user string, port int) sshConnectionDetails {
+
+    details := sshConnectionDetails{
+        Host: "localhost",
+        User: user,
+        Port: port,
+    }
+
+    details.Command = fmt.Sprintf("ssh %s@%s -p %d -o NoHostAuthenticationForLocalhost=yes",
+        details.User,
+        details.Host,
+        details.Port,
+    )
+
+    return details
+}
+
+func (connDetails *sshConnectionDetails) toJson() string {
+    jsonConnDetails, _ := json.MarshalIndent(connDetails, "", "  ")
+    return string(jsonConnDetails)
 }
 
 func (a *App) printOpenSSHConfig(ctx context.Context, opts sshOptions) error {
@@ -334,6 +394,36 @@ func (a *App) printOpenSSHConfig(ctx context.Context, opts sshOptions) error {
     }
 
     return status
+}
+
+func (a *App) startSSH(_ context.Context, _ sshOptions) error {
+
+    args := os.Args[1:]
+
+    for i, arg := range args {
+        if arg == "--start" {
+            args[i] = "--detached"
+        }
+    }
+
+    ready := make(chan os.Signal, 1)
+    signal.Notify(ready, syscall.SIGUSR1)
+
+    cmd := exec.Command(os.Args[0], args...)
+    cmd.Stdin = os.Stdin
+    cmd.Stdout = os.Stdout
+    cmd.Stderr = os.Stderr
+    cmd.SysProcAttr = &syscall.SysProcAttr{
+        Setsid: true,
+    }
+
+    if err := cmd.Start(); err != nil {
+        return err
+    }
+
+    <-ready
+
+    return nil
 }
 
 type cpOptions struct {
